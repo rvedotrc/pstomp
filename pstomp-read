@@ -1,0 +1,100 @@
+#!/usr/bin/perl
+# vi: set ts=4 sw=4 et :
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+my $host = "localhost";
+my $port = 61613;
+my $user;
+my $pass;
+my @dest;
+my $client_id;
+my $sub_name;
+my @modes;
+my $no_ack;
+my $retroactive;
+
+$| = 1;
+
+my @orig_argv = @ARGV;
+
+GetOptions(
+    "host|h=s"              => \$host,
+    "port|p=i"              => \$port,
+    "user|username|u=s"     => \$user,
+    "pass|password|P=s"     => \$pass,
+    "destination|d=s"       => \@dest,
+    "dump"                  => sub { push @modes, \&dumper },
+    "as-string"             => sub { push @modes, \&as_string },
+    "print-body"            => sub { push @modes, \&print_body },
+    "client-id|c=s"         => \$client_id,
+    "subscription|s=s"      => \$sub_name,
+    "no-ack"                => \$no_ack,
+    "retroactive|r"         => \$retroactive,
+) or exit 2;
+
+push @modes, \&print_body if not @modes;
+
+@ARGV and die;
+@dest or die;
+
+use Net::Stomp;
+my $stomp = Net::Stomp->new( { hostname => $host, port => $port } ) or die;
+
+my %conn;
+$conn{'login'} = $user if defined $user;
+$conn{'passcode'} = $pass if defined $pass;
+$conn{'client-id'} = $client_id if defined $client_id;
+$stomp->connect(\%conn) or die;
+
+for my $dest (@dest) {
+    my %sub;
+    $sub{destination} = $dest if defined $dest;
+    $sub{ack} = "client" unless $no_ack;
+    $sub{'activemq.prefetchSize'} = 1;
+    $sub{'activemq.subscriptionName'} = $sub_name if defined $sub_name;
+    $sub{'activemq.retroactive'} = "true" if $retroactive;
+    $stomp->subscribe(\%sub) or die;
+}
+
+while (1) {
+    # Keep-alive
+    while (not $stomp->can_read({ timeout => 20 })) {
+        $stomp->socket->syswrite("\n") or die "syswrite: $!";
+    }
+
+    # my $frame = $stomp->receive_frame or die "no frame: $!";
+    my $frame = $stomp->receive_frame or exec $^X, $0, @orig_argv;
+
+    &$_($frame) for @modes;
+
+    $stomp->ack( { frame => $frame } ) or die "no ack: $!"
+        if !$no_ack
+        and $frame->headers->{'message-id'};
+}
+
+$stomp->disconnect;
+exit;
+
+sub dumper
+{
+    my ($frame) = @_;
+    require Data::Dumper;
+    print Data::Dumper->Dump([ $frame ],[ 'frame' ]);
+}
+
+sub as_string
+{
+    my ($frame) = @_;
+    print $frame->as_string, "\n";
+}
+
+sub print_body
+{
+    my ($frame) = @_;
+    print $frame->body, "\n";
+}
+
+# eof pstomp-read

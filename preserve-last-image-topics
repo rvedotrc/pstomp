@@ -1,0 +1,159 @@
+#!/usr/bin/perl
+# vi: set ts=4 sw=4 et :
+
+use warnings;
+use strict;
+
+my $usage = <<EOF;
+
+preserve-last-image-topics is a tool to save and restore messages from
+ActiveMQ last image topics, for example to preserve the messages across a
+broker restart.
+
+Usage:
+
+    preserve-last-image-topics [OPTIONS] suck DIRECTORY /topic/...  [/topic/...]
+
+    preserve-last-image-topics [OPTIONS] blow DIRECTORY|FILE [DIRECTORY|FILE...]
+
+For example to save all 'status.*' topics directory ./topics, then reload
+them:
+
+    preserve-last-image-topics suck ./topics '/topic/status.*'
+
+    preserve-last-image-topics blow ./topics
+
+'suck' first deletes DIRECTORY if it exists, then creates it.  For each
+message read by 'suck', one file is created in DIRECTORY, where the filename
+is the same as the topic name.  With 'suck' you can save several sets of
+topics at once (just repeat the /topic/...  argument).  With 'blow' you can
+choose to reload just some files instead of the whole directory.
+
+Options are:
+
+    -h, --host ...      - host (default: localhost)
+    -p, --port ...      - port (default: 61613)
+    -u, --user ...      - username (default: none)
+    -P, --pass ...      - password (default: none)
+    -t, --timeout ...   - timeout (seconds) after which we assume 'suck' has completed
+
+EOF
+
+use Getopt::Long;
+my $host = "localhost";
+my $port = 61613;
+my $user;
+my $pass;
+my $timeout = 2;
+
+$| = 1;
+
+GetOptions(
+    "host|h=s"              => \$host,
+    "port|p=i"              => \$port,
+    "user|username|u=s"     => \$user,
+    "pass|password|P=s"     => \$pass,
+    "timeout|t=f"           => \$timeout,
+) or exit 2;
+
+my $mode = shift || '';
+
+if ($mode eq "suck") {
+
+    my ($dir, @dest) = @ARGV;
+    @dest or die $usage;
+
+    unlink glob("$dir/*");
+    rmdir $dir;
+    mkdir $dir or die "mkdir $dir: $!";
+
+    use Net::Stomp;
+    my $stomp = Net::Stomp->new( { hostname => $host, port => $port } ) or die;
+
+    my %conn;
+    $conn{'login'} = $user if defined $user;
+    $conn{'passcode'} = $pass if defined $pass;
+    $stomp->connect(\%conn) or die;
+
+    for my $dest (@dest) {
+        my %sub;
+        $sub{destination} = $dest;
+        $sub{ack} = "client";
+        $sub{'activemq.prefetchSize'} = 1;
+        $sub{'activemq.retroactive'} = "true";
+        $stomp->subscribe(\%sub) or die;
+    }
+
+    while (1) {
+        $stomp->can_read({ timeout => $timeout })
+            or last;
+        my $frame = $stomp->receive_frame or die;
+        save_message($frame, $dir);
+        $stomp->ack( { frame => $frame } ) or die "no ack: $!"
+            if $frame->headers->{'message-id'};
+    }
+
+    $stomp->disconnect;
+
+} elsif ($mode eq "blow") {
+
+    @ARGV or die $usage;
+
+    use Net::Stomp;
+    my $stomp = Net::Stomp->new( { hostname => $host, port => $port } ) or die;
+
+    my %conn;
+    $conn{'login'} = $user if defined $user;
+    $conn{'passcode'} = $pass if defined $pass;
+    $stomp->connect(\%conn) or die;
+
+    while (my $what = shift @ARGV) {
+        if (-d $what) {
+            unshift @ARGV, glob("$what/*");
+            next;
+        }
+
+        my $frame = load_message($what);
+
+        printf "Going to send to %s: %s", $frame->headers->{'destination'}, $frame->body;
+        $frame->command('SEND');
+        # FIXME? Does not preserve message-id
+        # FIXME? Does not preserve timestamp
+        $stomp->send_frame($frame);
+    }
+
+    $stomp->disconnect;
+
+} else {
+
+    die $usage;
+
+}
+
+exit;
+
+sub save_message {
+    my ($frame, $dir) = @_;
+    my $topic = $frame->headers->{'destination'};
+    print "Got message for $topic\n";
+    my ($filename) = $topic =~ m{^/topic/([^/]+)$}
+        or die "Unexpected destination format";
+    open(my $fh, ">", "$dir/$filename") or die $!;
+    use Data::Dumper;
+    print $fh Data::Dumper->Dump([ $frame ],[ 'frame' ]) or die $!;
+    close $fh or die $!;
+}
+
+sub load_message {
+    my ($file) = @_;
+
+    open(my $fh, "<", $file) or die "open $file: $!";
+    my $perl = do { local $/; <$fh> };
+    close $fh;
+
+    my $frame;
+    eval $perl or die $@;
+    return $frame;
+}
+
+# eof preserve-last-image-topics

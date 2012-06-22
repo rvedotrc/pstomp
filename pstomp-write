@@ -1,0 +1,71 @@
+#!/usr/bin/perl
+# vi: set ts=4 sw=4 et :
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+my $host = "localhost";
+my $port = 61613;
+my $user;
+my $pass;
+my $dest;
+my $slurp;
+my $client_id;
+
+GetOptions(
+    "host|h=s"              => \$host,
+    "port|p=i"              => \$port,
+    "user|username|u=s"     => \$user,
+    "pass|password|P=s"     => \$pass,
+    "destination|d=s"       => \$dest,
+    "slurp"                 => \$slurp,
+    "client-id|c=s"         => \$client_id,
+) or exit 2;
+
+# @ARGV allowed - list of files to read
+
+# send a message to the queue 'foo'
+use Net::Stomp;
+my $stomp = Net::Stomp->new( { hostname => $host, port => $port } ) or die;
+
+my %conn;
+$conn{'login'} = $user if defined $user;
+$conn{'passcode'} = $pass if defined $pass;
+$conn{'client-id'} = $client_id if defined $client_id;
+$stomp->connect(\%conn) or die;
+
+$/ = undef if $slurp;
+
+while (<STDIN>)
+{
+    my $id = make_id();
+
+    my %msg = (
+        destination => $dest,
+        body => "$_",
+        persistent => 'true',
+        receipt => $id,
+    );
+
+    $stomp->send(\%msg) or die;
+
+    while (my $frame = $stomp->receive_frame)
+    {
+        last if $frame->command eq "RECEIPT"
+            and $frame->headers->{"receipt-id"} eq $id;
+        warn "pstomp-write: warning: discarding ".$frame->command." frame whilst waiting for receipt-id $id\n";
+    }
+}
+
+$stomp->disconnect;
+exit;
+
+BEGIN { eval 'use Time::HiRes qw( gettimeofday )' }
+sub make_id
+{
+    my @t = (defined(&gettimeofday) ? (gettimeofday) : (time));
+    return join ".", @t, $$;
+}
+
+# eof pstomp-write
